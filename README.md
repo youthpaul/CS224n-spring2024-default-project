@@ -25,3 +25,17 @@ The BERT implementation part of the project was adapted from the "minbert" assig
 created by Shuyan Zhou, Zhengbao Jiang, Ritam Dutt, Brendon Boldt, Aditya Veerubhotla, and Graham Neubig.
 
 Parts of the code are from the [`transformers`](https://github.com/huggingface/transformers) library ([Apache License 2.0](./LICENSE)).
+
+## Part1 result
+
+* last-linear-layer-sst-dev:
+![last-linear-layer-sst-dev](./img/1.png)
+
+* last-linear-layer-cfimbd-dev:
+![last-linear-layer-cfimdb-dev](./img/2.png)
+
+* full-model-layer-sst-dev:
+![full-model-sst-dev](./img/3.png)
+
+* full-model-cfimbd-dev:
+![full-model-cfimdb-dev](./img/4.png)
