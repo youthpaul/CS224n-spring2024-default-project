@@ -73,7 +73,14 @@ class MultitaskBERT(nn.Module):
                 param.requires_grad = True
         # You will want to add layers here to perform the downstream tasks.
         ### TODO
-        raise NotImplementedError
+        self.sentiment_layer = nn.Linear(config.hidden_size, 5)
+        self.sentiment_dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        self.paraphrase_layer = nn.Linear(config.hidden_size * 2, 1)
+        self.paraphrase_dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        self.similarity_layer = nn.Linear(config.hidden_size * 2, 1)
+        self.similarity_dropout = nn.Dropout(config.hidden_dropout_prob)
 
 
     def forward(self, input_ids, attention_mask):
@@ -83,7 +90,8 @@ class MultitaskBERT(nn.Module):
         # When thinking of improvements, you can later try modifying this
         # (e.g., by adding other layers).
         ### TODO
-        raise NotImplementedError
+        bert_output = self.bert(input_ids, attention_mask)
+        return bert_output["pooler_output"]
 
 
     def predict_sentiment(self, input_ids, attention_mask):
@@ -93,7 +101,10 @@ class MultitaskBERT(nn.Module):
         Thus, your output should contain 5 logits for each sentence.
         '''
         ### TODO
-        raise NotImplementedError
+        bert_output = self.forward(input_ids, attention_mask)
+        outputs = self.sentiment_dropout(bert_output)
+        logits = self.sentiment_layer(outputs)
+        return logits
 
 
     def predict_paraphrase(self,
@@ -104,7 +115,13 @@ class MultitaskBERT(nn.Module):
         during evaluation.
         '''
         ### TODO
-        raise NotImplementedError
+        bert_output_1 = self.forward(input_ids_1, attention_mask_1)
+        bert_output_2 = self.forward(input_ids_2, attention_mask_2)
+
+        concatenated_output = torch.cat([bert_output_1, bert_output_2], dim=-1)
+        outputs = self.paraphrase_dropout(concatenated_output)
+
+        return self.paraphrase_layer(outputs).squeeze()
 
 
     def predict_similarity(self,
@@ -114,7 +131,13 @@ class MultitaskBERT(nn.Module):
         Note that your output should be unnormalized (a logit).
         '''
         ### TODO
-        raise NotImplementedError
+        bert_output_1 = self.forward(input_ids_1, attention_mask_1)
+        bert_output_2 = self.forward(input_ids_2, attention_mask_2)
+
+        concatenated_output = torch.cat([bert_output_1, bert_output_2], dim=-1)
+        outputs = self.similarity_dropout(concatenated_output)
+
+        return self.similarity_layer(outputs).squeeze()
 
 
 
@@ -210,7 +233,7 @@ def test_multitask(args):
     '''Test and save predictions on the dev and test sets of all three tasks.'''
     with torch.no_grad():
         device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-        saved = torch.load(args.filepath)
+        saved = torch.load(args.filepath, weights_only=False)
         config = saved['model_config']
 
         model = MultitaskBERT(config)

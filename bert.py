@@ -244,4 +244,6 @@ class BertModel(BertPreTrainedModel):
     first_tk = self.pooler_dense(first_tk)
     first_tk = self.pooler_af(first_tk)
 
+    # Maybe we should modify the pooler_dense, using mean pooler
+
     return {'last_hidden_state': sequence_output, 'pooler_output': first_tk}
