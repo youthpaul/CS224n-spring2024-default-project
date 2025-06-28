@@ -11,19 +11,23 @@ import torch
 from sklearn.metrics import f1_score, accuracy_score
 from tqdm import tqdm
 import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+from scipy import stats
 
 
 TQDM_DISABLE = False
 
 
-# Evaluate multitask model on SST only.
-def model_eval_sst(dataloader, model, device):
+# Evaluate multitask model on sentiment analysis
+def model_eval_sa(dataloader, model, device):
     model.eval()  # Switch to eval model, will turn off randomness like dropout.
     y_true = []
     y_pred = []
     sents = []
     sent_ids = []
-    for step, batch in enumerate(tqdm(dataloader, desc=f'eval', disable=TQDM_DISABLE)):
+    for step, batch in enumerate(tqdm(dataloader, desc=f'sa-eval', disable=TQDM_DISABLE)):
         b_ids, b_mask, b_labels, b_sents, b_sent_ids = batch['token_ids'],batch['attention_mask'],  \
                                                         batch['labels'], batch['sents'], batch['sent_ids']
 
@@ -43,47 +47,20 @@ def model_eval_sst(dataloader, model, device):
     f1 = f1_score(y_true, y_pred, average='macro')
     acc = accuracy_score(y_true, y_pred)
 
-    return acc, f1, y_pred, y_true, sents, sent_ids
+    return acc, y_pred, y_true
 
-
-# Evaluate multitask model on dev sets.
-def model_eval_multitask(sentiment_dataloader,
-                         paraphrase_dataloader,
-                         sts_dataloader,
-                         model, device):
-    model.eval()  # Switch to eval model, will turn off randomness like dropout.
-
+# Evaluate paraphrase detection
+def model_eval_pd(sts_dataloader, model, device):
     with torch.no_grad():
-        # Evaluate sentiment classification.
-        sst_y_true = []
-        sst_y_pred = []
-        sst_sent_ids = []
-        for step, batch in enumerate(tqdm(sentiment_dataloader, desc=f'eval', disable=TQDM_DISABLE)):
-            b_ids, b_mask, b_labels, b_sent_ids = batch['token_ids'], batch['attention_mask'], batch['labels'], batch['sent_ids']
-
-            b_ids = b_ids.to(device)
-            b_mask = b_mask.to(device)
-
-            logits = model.predict_sentiment(b_ids, b_mask)
-            y_hat = logits.argmax(dim=-1).flatten().cpu().numpy()
-            b_labels = b_labels.flatten().cpu().numpy()
-
-            sst_y_pred.extend(y_hat)
-            sst_y_true.extend(b_labels)
-            sst_sent_ids.extend(b_sent_ids)
-
-        sentiment_accuracy = np.mean(np.array(sst_y_pred) == np.array(sst_y_true))
-
-        # Evaluate paraphrase detection.
-        para_y_true = []
-        para_y_pred = []
-        para_sent_ids = []
-        for step, batch in enumerate(tqdm(paraphrase_dataloader, desc=f'eval', disable=TQDM_DISABLE)):
+        pd_y_true = []
+        pd_y_pred = []
+        pd_sent_ids = []
+        for step, batch in enumerate(tqdm(sts_dataloader, desc=f'para-eval', disable=TQDM_DISABLE)):
             (b_ids1, b_mask1,
-             b_ids2, b_mask2,
-             b_labels, b_sent_ids) = (batch['token_ids_1'], batch['attention_mask_1'],
-                          batch['token_ids_2'], batch['attention_mask_2'],
-                          batch['labels'], batch['sent_ids'])
+                b_ids2, b_mask2,
+                b_labels, b_sent_ids) = (batch['token_ids_1'], batch['attention_mask_1'],
+                            batch['token_ids_2'], batch['attention_mask_2'],
+                            batch['labels'], batch['sent_ids'])
 
             b_ids1 = b_ids1.to(device)
             b_mask1 = b_mask1.to(device)
@@ -94,22 +71,26 @@ def model_eval_multitask(sentiment_dataloader,
             y_hat = logits.sigmoid().round().flatten().cpu().numpy()
             b_labels = b_labels.flatten().cpu().numpy()
 
-            para_y_pred.extend(y_hat)
-            para_y_true.extend(b_labels)
-            para_sent_ids.extend(b_sent_ids)
+            pd_y_pred.extend(y_hat)
+            pd_y_true.extend(b_labels)
+            pd_sent_ids.extend(b_sent_ids)
+        pd_acc = accuracy_score(pd_y_true, pd_y_pred)
 
-        paraphrase_accuracy = np.mean(np.array(para_y_pred) == np.array(para_y_true))
+        return pd_acc, pd_y_pred, pd_y_true
 
-        # Evaluate semantic textual similarity.
+
+# Evaluate semantic textual similarity.
+def model_eval_sts(sts_dataloader, model, device):
+    with torch.no_grad():
         sts_y_true = []
         sts_y_pred = []
         sts_sent_ids = []
-        for step, batch in enumerate(tqdm(sts_dataloader, desc=f'eval', disable=TQDM_DISABLE)):
+        for step, batch in enumerate(tqdm(sts_dataloader, desc=f'sts-eval', disable=TQDM_DISABLE)):
             (b_ids1, b_mask1,
-             b_ids2, b_mask2,
-             b_labels, b_sent_ids) = (batch['token_ids_1'], batch['attention_mask_1'],
-                          batch['token_ids_2'], batch['attention_mask_2'],
-                          batch['labels'], batch['sent_ids'])
+                b_ids2, b_mask2,
+                b_labels, b_sent_ids) = (batch['token_ids_1'], batch['attention_mask_1'],
+                            batch['token_ids_2'], batch['attention_mask_2'],
+                            batch['labels'], batch['sent_ids'])
 
             b_ids1 = b_ids1.to(device)
             b_mask1 = b_mask1.to(device)
@@ -126,13 +107,69 @@ def model_eval_multitask(sentiment_dataloader,
         pearson_mat = np.corrcoef(sts_y_pred,sts_y_true)
         sts_corr = pearson_mat[1][0]
 
-        print(f'Sentiment classification accuracy: {sentiment_accuracy:.3f}')
-        print(f'Paraphrase detection accuracy: {paraphrase_accuracy:.3f}')
-        print(f'Semantic Textual Similarity correlation: {sts_corr:.3f}')
+        return sts_corr, sts_y_pred, sts_y_true
 
-        return (sentiment_accuracy,sst_y_pred, sst_sent_ids,
-                paraphrase_accuracy, para_y_pred, para_sent_ids,
-                sts_corr, sts_y_pred, sts_sent_ids)
+
+# Evaluate multitask model on dev sets.
+def model_eval_multitask(sentiment_dataloader,
+                         paraphrase_dataloader,
+                         sts_dataloader,
+                         model, device):
+    model.eval()  # Switch to eval model, will turn off randomness like dropout.
+
+    with torch.no_grad():
+        # Visualize for Sentiment Analysis
+        sa_acc, sa_y_pred, sa_y_true = model_eval_sa(sentiment_dataloader, model, device)
+
+        cm = confusion_matrix(sa_y_true, sa_y_pred, labels=[0,1,2,3,4])
+
+        plt.figure(figsize=(10,8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=['0','1','2','3','4'],
+                    yticklabels=['0','1','2','3','4'])
+        plt.title('Sentiment Analysis Confusion Matrix')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.savefig('./img/sentiment_cm.png', dpi=300)
+        plt.close()
+
+
+        # Visualization for Paraphrase Detection
+        pd_acc, para_y_pred, para_y_true = model_eval_pd(paraphrase_dataloader, model, device)
+
+        plt.figure(figsize=(6,5))
+        cm = confusion_matrix(para_y_true, para_y_pred)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['0','1'],
+                    yticklabels=['0','1'])
+        plt.title('Paraphrase Detection Performance')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.savefig('./img/paraphrase_cm.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+
+        # Scatter for STS
+        sts_corr, sts_y_pred, sts_y_true = model_eval_sts(sts_dataloader, model, device)
+
+        plt.figure(figsize=(8, 6))
+        plt.scatter(sts_y_pred, sts_y_true, alpha=0.4, s=15, color='green')
+        
+        pearson_corr, _ = stats.pearsonr(sts_y_pred, sts_y_true)
+        # plt.text(0.5, 4.7, f'Pearson: {pearson_corr:.3f}', 
+        #         fontsize=12, bbox=dict(facecolor='white', alpha=0.8))
+        
+        plt.title('Semantic Textual Similarity', fontsize=14)
+        plt.xlabel('Predictions', fontsize=12)
+        plt.ylabel('Similarity', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.3)
+        # plt.xlim(0, 5)
+        # plt.ylim(0, 5)
+        plt.savefig('./img/sts_scatter.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+        return sa_acc, pd_acc, sts_corr
+
 
 
 # Evaluate multitask model on test sets.

@@ -244,6 +244,11 @@ class BertModel(BertPreTrainedModel):
     first_tk = self.pooler_dense(first_tk)
     first_tk = self.pooler_af(first_tk)
 
-    # Maybe we should modify the pooler_dense, using mean pooler
+    # using mean pooling
+    # mask = attention_mask.unsqueeze(-1).float()
+    # valid_count = torch.sum(mask, dim=1)
+    # masked_output = sequence_output * mask
+    # pooled_output = torch.sum(masked_output, dim=1) / valid_count
+
 
     return {'last_hidden_state': sequence_output, 'pooler_output': first_tk}
