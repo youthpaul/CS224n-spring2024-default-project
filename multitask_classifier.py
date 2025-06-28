@@ -35,6 +35,9 @@ from datasets import (
 from evaluation import model_eval_multitask, model_eval_test_multitask
 from evaluation import model_eval_sa, model_eval_pd, model_eval_sts
 
+from peft import LoraConfig, TaskType, get_peft_model, LoftQConfig
+from peft import PeftConfig, PeftModel
+
 
 TQDM_DISABLE=False
 
@@ -52,6 +55,15 @@ def seed_everything(seed=11711):
 
 BERT_HIDDEN_SIZE = 768
 N_SENTIMENT_CLASSES = 5
+
+lora_config = LoraConfig(
+    task_type=TaskType.SEQ_CLS,
+    inference_mode=False,
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.1,
+    target_modules=['query', 'key', 'value']
+)
 
 
 class MultitaskBERT(nn.Module):
@@ -172,6 +184,17 @@ def save_model(model, optimizer, args, config, filepath):
     print(f"save the model to {filepath}")
 
 
+
+def save_config(args, config, filepath):
+    save_info = {
+        'args': args,
+        'model_config': config,
+    }
+
+    torch.save(save_info, filepath)
+    print(f"save the config to {filepath}")
+
+
 def check_gradients(model):
     """checking the gradient"""
     has_gradient = False
@@ -249,7 +272,7 @@ def train_sts(model, optimizer, args, epoch, train_dataloader, device):
     # Bregman regular (doc 5.3)
     bregman_beta = 0.01  # βproximal=0.01
     
-    for batch in tqdm(train_dataloader, desc=f'sts-epoch{epoch}', disable=TQDM_DISABLE):
+    for batch in tqdm(train_dataloader, desc=f'sts-train-{epoch}', disable=TQDM_DISABLE):
         # 数据加载（与paraphrase结构相同）
         b_ids_1, b_mask_1, b_ids_2, b_mask_2, b_labels = (
             batch['token_ids_1'], batch['attention_mask_1'],
@@ -346,6 +369,15 @@ def train_multitask(args):
     model = MultitaskBERT(config)
     model = model.to(device)
 
+    # See all layers' name
+    # for name, module in model.named_modules():
+    #     if isinstance(module, torch.nn.Linear):
+    #         print(f"- {name}")
+
+    # Apply LoRA
+    model = get_peft_model(model, lora_config)
+    # model.print_trainable_parameters()
+    
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
     best_dev_acc = 0
@@ -396,7 +428,10 @@ def train_multitask(args):
 
         if dev_acc > best_dev_acc:
             best_dev_acc = dev_acc
-            save_model(model, optimizer, args, config, args.filepath)
+            print('save the model..')
+            model.save_pretrained(args.filepath)
+            save_config(args, config, args.configpath)
+            # save_model(model, optimizer, args, config, args.filepath)
         
         print(f'epoch {epoch} loss: {dev_acc:.3f}')
 
@@ -406,12 +441,25 @@ def test_multitask(args):
     '''Test and save predictions on the dev and test sets of all three tasks.'''
     with torch.no_grad():
         device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-        saved = torch.load(args.filepath, weights_only=False)
+        saved = torch.load(args.configpath, weights_only=False)
         config = saved['model_config']
 
+        # Init model.
+        # config = {'hidden_dropout_prob': args.hidden_dropout_prob,
+        #         'num_labels': num_labels,
+        #         'hidden_size': 768,
+        #         'data_dir': '.',
+        #         'fine_tune_mode': args.fine_tune_mode}
+
+        # config = SimpleNamespace(**config)
+
         model = MultitaskBERT(config)
-        model.load_state_dict(saved['model'])
         model = model.to(device)
+        model = PeftModel.from_pretrained(model, args.filepath, is_trainable=False)
+
+        # model = MultitaskBERT(config)
+        # model.load_state_dict(saved['model'])
+        # model = model.to(device)
         print(f"Loaded model to test from {args.filepath}")
 
         sa_test_data, num_labels,para_test_data, sts_test_data = \
@@ -535,6 +583,7 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-multitask.pt' # Save path.
+    args.configpath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-config.pt' # Save config path
     seed_everything(args.seed)  # Fix the seed for reproducibility.
     train_multitask(args)
     test_multitask(args)
