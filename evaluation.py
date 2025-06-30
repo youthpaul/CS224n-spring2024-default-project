@@ -114,7 +114,8 @@ def model_eval_sts(sts_dataloader, model, device):
 def model_eval_multitask(sentiment_dataloader,
                          paraphrase_dataloader,
                          sts_dataloader,
-                         model, device):
+                         model, device,
+                         args):
     model.eval()  # Switch to eval model, will turn off randomness like dropout.
 
     with torch.no_grad():
@@ -130,7 +131,7 @@ def model_eval_multitask(sentiment_dataloader,
         plt.title('Sentiment Analysis Confusion Matrix')
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
-        plt.savefig('./img/sentiment_cm.png', dpi=300)
+        plt.savefig(f'{args.output_dir}img/sentiment_cm.png', dpi=300)
         plt.close()
 
 
@@ -145,7 +146,7 @@ def model_eval_multitask(sentiment_dataloader,
         plt.title('Paraphrase Detection Performance')
         plt.ylabel('True Label')
         plt.xlabel('Predicted Label')
-        plt.savefig('./img/paraphrase_cm.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'{args.output_dir}img/paraphrase_cm.png', dpi=300, bbox_inches='tight')
         plt.close()
 
 
@@ -165,7 +166,7 @@ def model_eval_multitask(sentiment_dataloader,
         plt.grid(True, linestyle='--', alpha=0.3)
         # plt.xlim(0, 5)
         # plt.ylim(0, 5)
-        plt.savefig('./img/sts_scatter.png', dpi=300, bbox_inches='tight')
+        plt.savefig(f'{args.output_dir}img/sts_scatter.png', dpi=300, bbox_inches='tight')
         plt.close()
 
         return sa_acc, pd_acc, sts_corr

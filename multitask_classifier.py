@@ -38,6 +38,8 @@ from evaluation import model_eval_sa, model_eval_pd, model_eval_sts
 from peft import LoraConfig, TaskType, get_peft_model, LoftQConfig
 from peft import PeftConfig, PeftModel
 
+from tokenizer import BertTokenizer
+
 
 TQDM_DISABLE=False
 
@@ -57,12 +59,13 @@ BERT_HIDDEN_SIZE = 768
 N_SENTIMENT_CLASSES = 5
 
 lora_config = LoraConfig(
-    task_type=TaskType.SEQ_CLS,
+    # task_type=TaskType.SEQ_CLS,
     inference_mode=False,
     r=8,
     lora_alpha=16,
     lora_dropout=0.1,
-    target_modules=['query', 'key', 'value']
+    target_modules=['query', 'key', 'value', 'attention_dense',
+                    'interm_dense', 'out_dense']
 )
 
 
@@ -93,8 +96,10 @@ class MultitaskBERT(nn.Module):
         self.paraphrase_dropout = nn.Dropout(config.hidden_dropout_prob)
 
         self.scale = nn.Linear(1, 1, bias=False)
-        self.similarity_layer = nn.Linear(config.hidden_size * 2, 1)
+        self.similarity_layer = nn.Linear(config.hidden_size, 1)
         self.similarity_dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
 
     def forward(self, input_ids, attention_mask):
@@ -136,12 +141,6 @@ class MultitaskBERT(nn.Module):
         outputs = self.paraphrase_dropout(concatenated_output)
         outputs = self.paraphrase_layer(outputs)
 
-        # using difference-product for Paraphrase-Detection
-        # absolute_diff = torch.abs(bert_output_1 - bert_output_2)  # |A-B|
-        # elementwise_product = bert_output_1 * bert_output_2        # A⊙B
-        # combined_features = torch.cat([absolute_diff, elementwise_product], dim=-1)
-        # outputs = self.paraphrase_dropout(combined_features)
-
         return outputs
 
 
@@ -152,12 +151,38 @@ class MultitaskBERT(nn.Module):
         Note that your output should be unnormalized (a logit).
         '''
         ### TODO
-        bert_output_1 = self.forward(input_ids_1, attention_mask_1)
-        bert_output_2 = self.forward(input_ids_2, attention_mask_2)
+        # Cross Encoding
+        # 1. concate tow sentences
+        sep_id = self.tokenizer.sep_token_id
+        input_ids = torch.cat([
+            input_ids_1, 
+            input_ids_2[:, 1:]
+        ], dim=1)
 
-        concatenated_output = torch.cat([bert_output_1, bert_output_2], dim=-1)
-        outputs = self.similarity_dropout(concatenated_output)
+        
+        # 2. set 1 to the middle [SEP] mask
+        attention_mask = torch.cat([
+            attention_mask_1[:, :-1],
+            torch.ones_like(attention_mask_1[:, :1]),  # [SEP] potision mask set to 1
+            attention_mask_2[:, 1:]
+        ], dim=1)
+
+        
+        # 3. final single sentence
+        cls_output = self.forward(input_ids, attention_mask)
+
+        # 4. using the [CLS] token to predict
+        outputs = self.similarity_dropout(cls_output)
         return self.similarity_layer(outputs).squeeze()
+
+
+        # Baseline
+        # bert_output_1 = self.forward(input_ids_1, attention_mask_1)
+        # bert_output_2 = self.forward(input_ids_2, attention_mask_2)
+
+        # concatenated_output = torch.cat([bert_output_1, bert_output_2], dim=-1)
+        # outputs = self.similarity_dropout(concatenated_output)
+        # return self.similarity_layer(outputs).squeeze()
 
         # using cosine similarity for STS
         # cosine_sim = F.cosine_similarity(bert_output_1, bert_output_2, dim=-1)  # [batch]
@@ -335,7 +360,7 @@ def train_multitask(args):
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
     # Create the data and its corresponding datasets and dataloader.
     sst_train_data, num_labels,para_train_data, sts_train_data = load_multitask_data(args.sst_train,args.para_train,args.sts_train, split ='train')
-    sst_dev_data, num_labels,para_dev_data, sts_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev, split ='train')
+    sst_dev_data, num_labels,para_dev_data, sts_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev, split ='dev')
 
     sst_train_data = SentenceClassificationDataset(sst_train_data, args)
     sst_dev_data = SentenceClassificationDataset(sst_dev_data, args)
@@ -375,7 +400,7 @@ def train_multitask(args):
     #         print(f"- {name}")
 
     # Apply LoRA
-    model = get_peft_model(model, lora_config)
+    # model = get_peft_model(model, lora_config)
     # model.print_trainable_parameters()
     
     lr = args.lr
@@ -383,7 +408,7 @@ def train_multitask(args):
     best_dev_acc = 0
     
     if args.debug:
-        N = 10
+        N = args.truncate_size
         pd_train_dataloader = truncate_dataloader(pd_train_dataloader, N)
         sts_train_dataloader = truncate_dataloader(sts_train_dataloader, N)
         sa_train_dataloader = truncate_dataloader(sa_train_dataloader, N)
@@ -391,6 +416,7 @@ def train_multitask(args):
         sts_dev_dataloader = truncate_dataloader(sts_dev_dataloader, N)
         sa_dev_dataloader = truncate_dataloader(sa_dev_dataloader, N)
 
+    patience = 0 # number of model dev acc stay unchange
     # Run for the specified number of epochs.
     for epoch in range(args.epochs):
         train_sa(model, optimizer, args, epoch, sa_train_dataloader,
@@ -419,30 +445,35 @@ def train_multitask(args):
         print(f'Paraphrase Detection accuracy: {dev_pd_acc:.3f}')
         print(f'Semantic Textual Similarity correlation: {dev_sts_corr:.3f}\n')
 
-        # dev_sentiment_accuracy,dev_sst_y_pred, dev_sst_sent_ids, \
-        #     dev_paraphrase_accuracy, dev_para_y_pred, dev_para_sent_ids, \
-        #     dev_sts_corr, dev_sts_y_pred, dev_sts_sent_ids = model_eval_multitask(sst_dev_dataloader,
-        #                                                             para_dev_dataloader,
-        #                                                             sts_dev_dataloader, model, device)
         dev_acc = (dev_sa_acc + dev_pd_acc + (dev_sts_corr + 1) / 2) / 3
 
         if dev_acc > best_dev_acc:
             best_dev_acc = dev_acc
             print('save the model..')
-            model.save_pretrained(args.filepath)
-            save_config(args, config, args.configpath)
-            # save_model(model, optimizer, args, config, args.filepath)
+            # model.save_pretrained(args.lorapath) # Lora
+            # save_config(args, config, args.configpath)
+            patience = 0
+            save_model(model, optimizer, args, config, args.filepath) # torch
+        else:
+            patience = patience + 1
         
         print(f'epoch {epoch} loss: {dev_acc:.3f}')
 
+        if patience == 3:
+            break
+    
+    return model
 
 
-def test_multitask(args):
+
+def test_multitask(args, model_0):
     '''Test and save predictions on the dev and test sets of all three tasks.'''
     with torch.no_grad():
         device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-        saved = torch.load(args.configpath, weights_only=False)
+        saved = torch.load(args.filepath, weights_only=False)
         config = saved['model_config']
+        model = MultitaskBERT(config)
+        model.load_state_dict(saved['model'])
 
         # Init model.
         # config = {'hidden_dropout_prob': args.hidden_dropout_prob,
@@ -453,13 +484,11 @@ def test_multitask(args):
 
         # config = SimpleNamespace(**config)
 
-        model = MultitaskBERT(config)
-        model = model.to(device)
-        model = PeftModel.from_pretrained(model, args.filepath, is_trainable=False)
-
         # model = MultitaskBERT(config)
-        # model.load_state_dict(saved['model'])
-        # model = model.to(device)
+        # model = PeftModel.from_pretrained(model, args.lorapath, is_trainable=False)
+        model = model.to(device)
+
+
         print(f"Loaded model to test from {args.filepath}")
 
         sa_test_data, num_labels,para_test_data, sts_test_data = \
@@ -491,14 +520,32 @@ def test_multitask(args):
                                          collate_fn=sts_test_data.collate_fn)
         sts_dev_dataloader = DataLoader(sts_dev_data, shuffle=False, batch_size=args.batch_size,
                                         collate_fn=sts_dev_data.collate_fn)
+        
+
+        if args.debug:
+            N = args.truncate_size
+            para_dev_dataloader = truncate_dataloader(para_dev_dataloader, N)
+            sts_dev_dataloader = truncate_dataloader(sts_dev_dataloader, N)
+            sa_dev_dataloader = truncate_dataloader(sa_dev_dataloader, N)
+        
 
         dev_sa_acc, dev_pd_acc, dev_sts_corr = model_eval_multitask(sa_dev_dataloader,
                                                                     para_dev_dataloader,
-                                                                    sts_dev_dataloader, model, device)
+                                                                    sts_dev_dataloader, model, 
+                                                                    device, args)
 
         print(f'Sentiment Analysis accuracy: {dev_sa_acc:.3f}')
         print(f'Paraphrase Detection accuracy: {dev_pd_acc:.3f}')
         print(f'Semantic Textual Similarity correlation: {dev_sts_corr:.3f}\n')
+
+        # dev_sa_acc, dev_pd_acc, dev_sts_corr = model_eval_multitask(sa_dev_dataloader,
+        #                                                             para_dev_dataloader,
+        #                                                             sts_dev_dataloader, model_0, device)
+
+        # print('loss of model_0:')
+        # print(f'Sentiment Analysis accuracy: {dev_sa_acc:.3f}')
+        # print(f'Paraphrase Detection accuracy: {dev_pd_acc:.3f}')
+        # print(f'Semantic Textual Similarity correlation: {dev_sts_corr:.3f}\n')
 
 
         # test_sst_y_pred, \
@@ -557,6 +604,7 @@ def get_args():
 
     parser.add_argument("--seed", type=int, default=11711)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--truncate_size", type=int, default=1)
     parser.add_argument("--fine-tune-mode", type=str,
                         help='last-linear-layer: the BERT parameters are frozen and the task specific head parameters are updated; full-model: BERT parameters are updated as well',
                         choices=('last-linear-layer', 'full-model'), default="last-linear-layer")
@@ -576,6 +624,8 @@ def get_args():
     parser.add_argument("--hidden_dropout_prob", type=float, default=0.3)
     parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
 
+    parser.add_argument("--output_dir", type=str, help="img output diractory", default="./")
+
     args = parser.parse_args()
     return args
 
@@ -583,7 +633,7 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     args.filepath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-multitask.pt' # Save path.
-    args.configpath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-config.pt' # Save config path
+    args.lorapath = f'{args.fine_tune_mode}-{args.epochs}-{args.lr}-lora' # Save config path
     seed_everything(args.seed)  # Fix the seed for reproducibility.
-    train_multitask(args)
-    test_multitask(args)
+    model = train_multitask(args)
+    test_multitask(args, model)
