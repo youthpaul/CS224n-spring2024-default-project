@@ -40,6 +40,9 @@ from peft import PeftConfig, PeftModel
 
 from tokenizer import BertTokenizer
 
+from pcgrad import PCGrad
+import itertools
+import os
 
 TQDM_DISABLE=False
 
@@ -79,7 +82,7 @@ class MultitaskBERT(nn.Module):
     '''
     def __init__(self, config):
         super(MultitaskBERT, self).__init__()
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        self.bert = BertModel.from_pretrained('/root/autodl-fs/bert-base-uncased')
         # last-linear-layer mode does not require updating BERT paramters.
         assert config.fine_tune_mode in ["last-linear-layer", "full-model"]
         for param in self.bert.parameters():
@@ -99,7 +102,7 @@ class MultitaskBERT(nn.Module):
         self.similarity_layer = nn.Linear(config.hidden_size, 1)
         self.similarity_dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.tokenizer = BertTokenizer.from_pretrained('/root/autodl-fs/bert-base-uncased')
 
 
     def forward(self, input_ids, attention_mask):
@@ -197,7 +200,7 @@ class MultitaskBERT(nn.Module):
 def save_model(model, optimizer, args, config, filepath):
     save_info = {
         'model': model.state_dict(),
-        'optim': optimizer.state_dict(),
+        # 'optim': optimizer.state_dict(),
         'args': args,
         'model_config': config,
         'system_rng': random.getstate(),
@@ -236,8 +239,7 @@ def check_gradients(model):
 def train_sa(model, optimizer, args, epoch, train_dataloader, device):
     # Trainging for Sentiment analysis
     model.train()
-    train_loss = 0
-    num_batches = 0
+    loss_sa = []
     for batch in tqdm(train_dataloader, desc=f'sa-train-{epoch}', disable=TQDM_DISABLE):
         b_ids, b_mask, b_labels = (batch['token_ids'],
                                     batch['attention_mask'], batch['labels'])
@@ -246,25 +248,25 @@ def train_sa(model, optimizer, args, epoch, train_dataloader, device):
         b_mask = b_mask.to(device)
         b_labels = b_labels.to(device)
 
-        optimizer.zero_grad()
+        # optimizer.zero_grad()
         logits = model.predict_sentiment(b_ids, b_mask)
         loss = F.cross_entropy(logits, b_labels.view(-1), reduction='sum') / args.batch_size
 
-        loss.backward()
-        # check_gradients(model)
-        optimizer.step()
+        loss_sa.append(loss)
 
-        train_loss += loss.item()
-        num_batches += 1
+        # loss.backward()
+        # check_gradients(model)
+        # optimizer.step()
+    return loss_sa
+
 
 
 
 def train_pd(model, optimizer, args, epoch, train_dataloader, device):
     # Trainging for Paraphrase detection
     model.train()
-    train_loss = 0
-    num_batches = 0
     criterion = nn.BCEWithLogitsLoss(reduction='sum')
+    loss_pd = []
     for batch in tqdm(train_dataloader, desc=f'para-train-{epoch}', disable=TQDM_DISABLE):
         b_ids_1, b_mask_1, b_ids_2, b_mask_2, b_labels = (batch['token_ids_1'], batch['attention_mask_1'],
                                                             batch['token_ids_2'], batch['attention_mask_2'],
@@ -276,29 +278,25 @@ def train_pd(model, optimizer, args, epoch, train_dataloader, device):
         b_mask_2 = b_mask_2.to(device)
         b_labels = b_labels.to(device)
 
-        optimizer.zero_grad()
+        # optimizer.zero_grad()
         logits = model.predict_paraphrase(b_ids_1, b_mask_1, b_ids_2, b_mask_2)
         loss = F.binary_cross_entropy_with_logits(logits.view(-1), b_labels.float().view(-1), reduction='mean')
 
-        loss.backward()
-        # check_gradients(model)
-        optimizer.step()
+        loss_pd.append(loss)
 
-        train_loss += loss.item()
-        num_batches += 1
+        # loss.backward()
+        # check_gradients(model)
+        # optimizer.step()
+    return loss_pd
+
 
 
 def train_sts(model, optimizer, args, epoch, train_dataloader, device):
     # using regression loss to train
     model.train()
-    train_loss = 0.0
-    num_batches = 0
-    
-    # Bregman regular (doc 5.3)
-    bregman_beta = 0.01  # βproximal=0.01
-    
+    loss_sts = []
     for batch in tqdm(train_dataloader, desc=f'sts-train-{epoch}', disable=TQDM_DISABLE):
-        # 数据加载（与paraphrase结构相同）
+        # data loading
         b_ids_1, b_mask_1, b_ids_2, b_mask_2, b_labels = (
             batch['token_ids_1'], batch['attention_mask_1'],
             batch['token_ids_2'], batch['attention_mask_2'],
@@ -311,20 +309,64 @@ def train_sts(model, optimizer, args, epoch, train_dataloader, device):
         b_mask_2 = b_mask_2.to(device)
         b_labels = b_labels.to(device).float()  # to float
         
-        optimizer.zero_grad()
+        # optimizer.zero_grad()
         
-        # using cosine similarity + scalling
+        # using Cross Encoding
         predictions = model.predict_similarity(b_ids_1, b_mask_1, b_ids_2, b_mask_2)
         
         loss = F.mse_loss(predictions, b_labels, reduction='sum') / args.batch_size
-        
-        loss.backward()
-        # check_gradients(model)
-        optimizer.step()
-        
-        train_loss += loss.item()
-        num_batches += 1
 
+        loss_sts.append(loss)
+        
+        # loss.backward()
+        # check_gradients(model)
+        # optimizer.step()
+    return loss_sts
+        
+
+def train_multi(model, sa_batch, pd_batch, sts_batch, args, device):
+    model.train()
+    sa_b_ids, sa_b_mask, sa_b_labels = (sa_batch['token_ids'],
+                            sa_batch['attention_mask'], sa_batch['labels'])
+    pd_b_ids_1, pd_b_mask_1, pd_b_ids_2, pd_b_mask_2, pd_b_labels = (pd_batch['token_ids_1'], 
+                                                    pd_batch['attention_mask_1'],
+                                                    pd_batch['token_ids_2'], 
+                                                    pd_batch['attention_mask_2'],
+                                                    pd_batch['labels'])
+    sts_b_ids_1, sts_b_mask_1, sts_b_ids_2, sts_b_mask_2, sts_b_labels = (
+            sts_batch['token_ids_1'], sts_batch['attention_mask_1'],
+            sts_batch['token_ids_2'], sts_batch['attention_mask_2'],
+            sts_batch['labels'])
+    
+    sa_b_ids = sa_b_ids.to(device)
+    sa_b_mask = sa_b_mask.to(device)
+    sa_b_labels = sa_b_labels.to(device)
+
+    pd_b_ids_1 = pd_b_ids_1.to(device)
+    pd_b_ids_2 = pd_b_ids_2.to(device)
+    pd_b_mask_1 = pd_b_mask_1.to(device)
+    pd_b_mask_2 = pd_b_mask_2.to(device)
+    pd_b_labels = pd_b_labels.to(device)
+
+    sts_b_ids_1 = sts_b_ids_1.to(device)
+    sts_b_ids_2 = sts_b_ids_2.to(device)
+    sts_b_mask_1 = sts_b_mask_1.to(device)
+    sts_b_mask_2 = sts_b_mask_2.to(device)
+    sts_b_labels = sts_b_labels.to(device).float()  # to float
+
+    # sentiment analysis
+    sa_logits = model.predict_sentiment(sa_b_ids, sa_b_mask)
+    sa_loss = F.cross_entropy(sa_logits, sa_b_labels.view(-1), reduction='sum') / args.batch_size
+
+    # paraphrase detection
+    pd_logits = model.predict_paraphrase(pd_b_ids_1, pd_b_mask_1, pd_b_ids_2, pd_b_mask_2)
+    pd_loss = F.binary_cross_entropy_with_logits(pd_logits.view(-1), pd_b_labels.float().view(-1), reduction='mean')
+
+    # sts
+    sts_predictions = model.predict_similarity(sts_b_ids_1, sts_b_mask_1, sts_b_ids_2, sts_b_mask_2)
+    sts_loss = F.mse_loss(sts_predictions, sts_b_labels, reduction='sum') / args.batch_size
+
+    return sa_loss, pd_loss, sts_loss
 
 from itertools import islice
 
@@ -405,6 +447,7 @@ def train_multitask(args):
     
     lr = args.lr
     optimizer = AdamW(model.parameters(), lr=lr)
+    optimizer = PCGrad(optimizer) # apply PCGrad
     best_dev_acc = 0
     
     if args.debug:
@@ -416,14 +459,58 @@ def train_multitask(args):
         sts_dev_dataloader = truncate_dataloader(sts_dev_dataloader, N)
         sa_dev_dataloader = truncate_dataloader(sa_dev_dataloader, N)
 
+    # count the max length
+    sa_batch_count = len(sa_train_dataloader)
+    pd_batch_count = len(pd_train_dataloader)
+    sts_batch_count = len(sts_train_dataloader)
+    max_batches = max(sa_batch_count, pd_batch_count, sts_batch_count)
+
+    # create cyclic iterater to sample
+    sa_cyclic = itertools.cycle(sa_train_dataloader)
+    pd_cyclic = itertools.cycle(pd_train_dataloader)
+    sts_cyclic = itertools.cycle(sts_train_dataloader)
+
     patience = 0 # number of model dev acc stay unchange
+
     # Run for the specified number of epochs.
     for epoch in range(args.epochs):
-        train_sa(model, optimizer, args, epoch, sa_train_dataloader,
-                                 device)
-        train_pd(model, optimizer, args, epoch, pd_train_dataloader,
-                                  device)
-        train_sts(model, optimizer, args, epoch, sts_train_dataloader, device)
+        total_loss = 0.0
+        
+        # train for PCGrad
+        with tqdm(total=max_batches, desc=f'Training of Epoch {epoch}:', 
+                bar_format='{l_bar}{bar:20}{r_bar}') as pbar:
+            
+            # interleaved training
+            for step in range(max_batches):
+                sa_batch = next(sa_cyclic)
+                pd_batch = next(pd_cyclic)
+                sts_batch = next(sts_cyclic)
+                
+                # compute the loss of three tasks
+                loss_sa, loss_pd, loss_sts = train_multi(model,sa_batch, pd_batch,
+                                                        sts_batch, args, device)
+                
+                # PCGrad
+                optimizer.zero_grad()
+                optimizer.pc_backward([loss_sa, loss_pd, loss_sts])
+                optimizer.step()
+
+                pbar.update(1)
+                
+        # loss_sa = train_sa(model, optimizer, args, epoch, sa_train_dataloader,
+        #                          device)
+        # loss_pd = train_pd(model, optimizer, args, epoch, pd_train_dataloader,
+        #                           device)
+        # loss_sts = train_sts(model, optimizer, args, epoch, sts_train_dataloader, device)
+
+        # PCGrad
+        # optimizer.zero_grad()
+        # optimizer.pc_backward(loss_sa + loss_pd + loss_sts)
+        # optimizer.step()
+
+        # loss = loss_sa + loss_pd + loss_sts
+        # loss = [el.to('cpu') for el in loss]
+        # optimizer.minimize(loss)
 
         # evaluate for train
         train_sa_acc, *_ = model_eval_sa(sa_train_dataloader, model, device)
@@ -458,6 +545,9 @@ def train_multitask(args):
             patience = patience + 1
         
         print(f'epoch {epoch} loss: {dev_acc:.3f}')
+        print()
+        print('='*200)
+        print()
 
         if patience == 3:
             break
@@ -537,6 +627,11 @@ def test_multitask(args, model_0):
         print(f'Sentiment Analysis accuracy: {dev_sa_acc:.3f}')
         print(f'Paraphrase Detection accuracy: {dev_pd_acc:.3f}')
         print(f'Semantic Textual Similarity correlation: {dev_sts_corr:.3f}\n')
+
+        with open('/root/autodl-fs/dev_log.txt', "w+") as f:
+            f.write(f"dev sentiment acc :: {dev_sa_acc :.3f}\n")
+            f.write(f'dev paraphrase detection acc :: {dev_pd_acc:.3f}\n')
+            f.write(f'dev sts corr :: {dev_sts_corr:.3f}\n')
 
         # dev_sa_acc, dev_pd_acc, dev_sts_corr = model_eval_multitask(sa_dev_dataloader,
         #                                                             para_dev_dataloader,
@@ -637,3 +732,4 @@ if __name__ == "__main__":
     seed_everything(args.seed)  # Fix the seed for reproducibility.
     model = train_multitask(args)
     test_multitask(args, model)
+    # os.system('shutdown')
